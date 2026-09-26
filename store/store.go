@@ -100,6 +100,22 @@ func Open(cfg Config) (*Store, error) {
 		s.data[id] = df
 	}
 
+	// Self-consistency check: every block referenced by the index must
+	// lie within its data file. A violation means the data directory is
+	// corrupt (e.g. a file was truncated or lost); fail loudly instead
+	// of silently serving errors later. Orphan bytes beyond the last
+	// referenced block (crash between append and index persist) are
+	// fine and simply never referenced.
+	for _, ss := range s.series {
+		for _, bm := range ss.blocks {
+			df := s.data[bm.FileID]
+			if df == nil || bm.Offset+recordHeaderSize+uint64(bm.Length) > df.offset {
+				s.closeFiles()
+				return nil, fmt.Errorf("%w: block %+v beyond data file %d", ErrCorruptIndex, bm, bm.FileID)
+			}
+		}
+	}
+
 	// Current append target gets a fresh file id.
 	cur, err := openDataFile(cfg.Dir, s.nextFile)
 	if err != nil {

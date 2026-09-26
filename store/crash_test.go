@@ -215,3 +215,32 @@ func TestCrashLoop(t *testing.T) {
 		t.Fatalf("got %d points, want %d", len(got), len(want))
 	}
 }
+
+// TestMissingDataFileFails: if a data file referenced by the index is
+// lost or truncated, Open must fail loudly (index and data not
+// self-consistent) instead of silently recreating an empty file.
+func TestMissingDataFileFails(t *testing.T) {
+	dir := t.TempDir()
+	cfg := testConfig(dir)
+	s, _ := Open(cfg)
+	for i := 0; i < 100; i++ {
+		s.Write("m", codec.Point{TS: int64(i), V: float64(i)})
+	}
+	s.Flush()
+	// find the data file holding the block
+	var refID uint64
+	for _, ss := range s.series {
+		for _, bm := range ss.blocks {
+			refID = bm.FileID
+		}
+	}
+	s.Close()
+
+	// truncate the referenced data file
+	if err := os.Truncate(filepath.Join(dir, dataFileName(refID)), 4); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Open(cfg); err == nil {
+		t.Fatal("expected Open to fail on truncated referenced data file")
+	}
+}
