@@ -441,16 +441,22 @@ func (s *Store) Close() error {
 		return nil
 	}
 	s.closed = true
-	if s.compactStop != nil {
-		close(s.compactStop)
-		<-s.compactDone
+	stop, done := s.compactStop, s.compactDone
+	s.mu.Unlock()
+	// Stop the background compactor without holding the lock: its
+	// CompactOnce needs the lock too, so waiting here while holding it
+	// would deadlock.
+	if stop != nil {
+		close(stop)
+		<-done
 	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	err := s.flushLocked()
 	s.wal.close()
 	for _, df := range s.data {
 		df.close()
 	}
-	s.mu.Unlock()
 	return err
 }
 

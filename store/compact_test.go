@@ -282,3 +282,44 @@ func TestBackgroundCompactLoop(t *testing.T) {
 		t.Fatalf("got %d points, want 30", len(got))
 	}
 }
+
+// TestCloseWithActiveCompactor: closing while the background compactor
+// is firing must not deadlock (regression test).
+func TestCloseWithActiveCompactor(t *testing.T) {
+	dir := t.TempDir()
+	cfg := testConfig(dir)
+	cfg.MaxBlockPoints = 8
+	cfg.MinMergeBlocks = 2
+	cfg.CompactInterval = 1 // 1ns: compactor fires as fast as possible
+	s, err := Open(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 200; i++ {
+		s.Write("m", codec.Point{TS: int64(i), V: float64(i)})
+	}
+	done := make(chan error, 1)
+	go func() { done <- s.Close() }()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatal(err)
+		}
+	case <-time.After(30 * time.Second):
+		t.Fatal("Close deadlocked with active compactor")
+	}
+	got, err := func() ([]codec.Point, error) {
+		s2, err := Open(testConfig(dir))
+		if err != nil {
+			return nil, err
+		}
+		defer s2.Close()
+		return s2.Query("m", 0, 200)
+	}()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 200 {
+		t.Fatalf("got %d points after close, want 200", len(got))
+	}
+}

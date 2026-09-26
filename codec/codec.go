@@ -6,7 +6,10 @@
 // configuration never breaks decodability of existing blocks.
 package codec
 
-import "errors"
+import (
+	"errors"
+	"math"
+)
 
 // CodecID identifies the encoding strategy of a block.
 type CodecID uint8
@@ -53,7 +56,9 @@ func (c Config) Validate() error {
 	case CodecLossless:
 		return nil
 	case CodecLossy:
-		if c.Epsilon <= 0 {
+		// reject zero/negative, NaN and Inf: the error bound must be a
+		// finite positive number to be meaningful
+		if c.Epsilon <= 0 || math.IsNaN(c.Epsilon) || math.IsInf(c.Epsilon, 0) {
 			return ErrInvalidConfig
 		}
 		return nil
