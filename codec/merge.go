@@ -74,7 +74,10 @@ func (s *Store) MergeNow() error {
 	}
 	encoded := make([][]byte, len(chunks))
 	for i, c := range chunks {
-		data, err := encodeBlock(c, s.cfg.Mode, s.cfg.Epsilon)
+		// 稳定编码：重新量化只有在重建值与输入逐比特相同时才进行，
+		// 否则精确保留。这样特殊值（NaN/±Inf）不丢失，有限样本的
+		// 误差也不会因反复合并而累积退化，合并前后查询结果一致。
+		data, err := encodeBlockOpts(c, s.cfg.Mode, s.cfg.Epsilon, true)
 		if err != nil {
 			return err
 		}
