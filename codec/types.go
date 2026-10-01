@@ -1,7 +1,10 @@
 // Package codec 提供时序数据的分块压缩编码、持久化存储与区间查询能力。
 package codec
 
-import "errors"
+import (
+	"errors"
+	"math"
+)
 
 // Sample 表示一个时序采样点。T 为毫秒时间戳，V 为采样值。
 type Sample struct {
@@ -60,8 +63,8 @@ func (c Config) validate() error {
 	if c.Dir == "" {
 		return errors.New("codec: Dir is required")
 	}
-	if c.Mode == ModeLossy && c.Epsilon <= 0 {
-		return errors.New("codec: lossy mode requires Epsilon > 0")
+	if c.Mode == ModeLossy && !validEpsilon(c.Epsilon) {
+		return ErrInvalidEpsilon
 	}
 	if c.BlockMaxSamples <= 0 {
 		return errors.New("codec: BlockMaxSamples must be > 0")
@@ -71,3 +74,14 @@ func (c Config) validate() error {
 
 // ErrClosed 表示存储已关闭。
 var ErrClosed = errors.New("codec: store closed")
+
+// ErrInvalidEpsilon 表示有损模式的误差上界配置非法。
+// 有损模式的 Epsilon 必须是正的有限 float64；
+// 0、负数、NaN、正无穷、负无穷均会被 Open 拒绝（不创建任何文件）。
+var ErrInvalidEpsilon = errors.New("codec: lossy mode requires a positive finite Epsilon")
+
+// validEpsilon 报告 eps 是否为合法的有损误差上界（正的有限数）。
+// NaN 使 eps > 0 为 false，因此被拒绝。
+func validEpsilon(eps float64) bool {
+	return eps > 0 && !math.IsInf(eps, 0)
+}

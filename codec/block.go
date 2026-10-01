@@ -12,7 +12,7 @@ import (
 // 块格式（自描述，配置变更不影响旧块解码）：
 //
 //	[0:2]  magic "TB"
-//	[2]    version = 1
+//	[2]    version (1 或 2)
 //	[3]    mode (0=lossless, 1=lossy)
 //	[4:12] epsilon (float64, 有损模式量化步长)
 //	[12:16] count (uint32)
@@ -23,24 +23,43 @@ import (
 //
 // 时间戳流：delta-of-delta + zigzag varint（无损）。
 // 值流（无损）：Gorilla 风格 XOR 位流。
-// 值流（有损）：round(v/epsilon) 的 zigzag varint 增量序列，误差 <= epsilon/2。
+// 值流（有损 v1，仅用于解码既有数据）：round(v/epsilon) 的 zigzag varint
+//
+//	增量序列，误差 <= epsilon/2。
+//
+// 值流（有损 v2）：逐样本一条记录——
+//
+//	uvarint(0)        ：转义，后跟 8 字节原始 float64 位（NaN/Inf/无法
+//	                    满足误差上界的样本逐比特保留）；
+//	uvarint(z+1) (z>0)：量化增量 zigzag(delta) = z，解码值 q*epsilon。
+//
+// v2 编码时逐样本校验 |decoded-original| <= epsilon 且量化表示幂等
+// （对解码值再次量化得到同一 q），不满足则转义为原始值，因此任意
+// 有限样本的误差上界在封块、重启、合并重编码后都严格成立。
 const (
-	blockMagic0   = 'T'
-	blockMagic1   = 'B'
-	blockVersion  = 1
+	blockMagic0 = 'T'
+	blockMagic1 = 'B'
+	// blockVersionV1 是既有落盘数据的版本：有损值流无转义机制，
+	// 其解码规则不得改变。
+	blockVersionV1 = 1
+	// blockVersion 是当前写入版本。
+	blockVersion  = 2
 	blockHeadSize = 32
 	blockCRCSize  = 4
 )
 
 var errCorruptBlock = errors.New("codec: corrupt block")
 
+// maxInt64Float 是 2^63 的 float64 值；|q| >= 2^63 时 int64 转换越界。
+const maxInt64Float = 9223372036854775808.0
+
 // encodeBlock 将一组按时间排序的样本编码为一个压缩块。
 func encodeBlock(samples []Sample, mode Mode, epsilon float64) ([]byte, error) {
 	if len(samples) == 0 {
 		return nil, errors.New("codec: cannot encode empty block")
 	}
-	if mode == ModeLossy && epsilon <= 0 {
-		return nil, errors.New("codec: lossy encoding requires epsilon > 0")
+	if mode == ModeLossy && !validEpsilon(epsilon) {
+		return nil, ErrInvalidEpsilon
 	}
 
 	buf := make([]byte, blockHeadSize, blockHeadSize+len(samples)*8)
@@ -102,20 +121,54 @@ func encodeBlock(samples []Sample, mode Mode, epsilon float64) ([]byte, error) {
 		buf = append(buf, bw.bytes()...)
 	case ModeLossy:
 		prevQ := int64(0)
-		for i, s := range samples {
-			q := int64(math.Round(s.V / epsilon))
-			if i == 0 {
-				buf = appendVarint(buf, zigzag(q))
-			} else {
-				buf = appendVarint(buf, zigzag(q-prevQ))
+		for _, s := range samples {
+			if q, ok := quantizeLossy(s.V, epsilon); ok {
+				// z == MaxUint64 时 z+1 回绕为 0（转义标记），改走转义。
+				if z := zigzag(q - prevQ); z != math.MaxUint64 {
+					buf = appendVarint(buf, z+1)
+					prevQ = q
+					continue
+				}
 			}
-			prevQ = q
+			// 转义：逐比特保留原始值（NaN/Inf/无法满足误差上界的样本）。
+			buf = appendVarint(buf, 0)
+			buf = binary.LittleEndian.AppendUint64(buf, math.Float64bits(s.V))
 		}
 	}
 
 	crc := crc32.ChecksumIEEE(buf)
 	buf = binary.LittleEndian.AppendUint32(buf, crc)
 	return buf, nil
+}
+
+// quantizeLossy 尝试将 v 量化为 epsilon 的整数倍，返回量化值 q。
+// 仅当全部数值保证成立时返回 ok=true：
+//   - v 为有限数（NaN 与正负无穷必须转义）；
+//   - q 可表示为 int64（|q| < 2^63，避免越界转换的实现定义行为）；
+//   - 解码值 float64(q)*epsilon 与 v 的偏差不超过 epsilon（编码时校验，
+//     覆盖 float64 乘法舍入与极端量级）；
+//   - 量化表示幂等：对解码值再次量化得到同一 q，保证后台合并按相同
+//     epsilon 重编码时值逐比特不漂移、误差不累积。
+//
+// 否则返回 ok=false，调用方必须按原始值逐比特保留（转义）。
+func quantizeLossy(v, epsilon float64) (int64, bool) {
+	if math.IsNaN(v) || math.IsInf(v, 0) {
+		return 0, false
+	}
+	q := math.Round(v / epsilon)
+	if !(math.Abs(q) < maxInt64Float) {
+		return 0, false
+	}
+	qi := int64(q)
+	dec := float64(qi) * epsilon
+	if !(math.Abs(dec-v) <= epsilon) {
+		return 0, false
+	}
+	// 幂等性在 float64 域比较，避免再次越界转换。
+	if math.Round(dec/epsilon) != q {
+		return 0, false
+	}
+	return qi, true
 }
 
 // decodeBlock 将压缩块解码为按时间排序的样本序列。
@@ -126,8 +179,9 @@ func decodeBlock(data []byte) ([]Sample, error) {
 	if data[0] != blockMagic0 || data[1] != blockMagic1 {
 		return nil, errCorruptBlock
 	}
-	if data[2] != blockVersion {
-		return nil, fmt.Errorf("codec: unsupported block version %d", data[2])
+	version := int(data[2])
+	if version != blockVersionV1 && version != blockVersion {
+		return nil, fmt.Errorf("codec: unsupported block version %d", version)
 	}
 	body, crcBytes := data[:len(data)-blockCRCSize], data[len(data)-blockCRCSize:]
 	if crc32.ChecksumIEEE(body) != binary.LittleEndian.Uint32(crcBytes) {
@@ -158,11 +212,11 @@ func decodeBlock(data []byte) ([]Sample, error) {
 		ts[i] = ts[i-1] + delta
 		prevDelta = delta
 	}
-	return decodeValues(mode, epsilon, count, ts, rest)
+	return decodeValues(mode, epsilon, version, count, ts, rest)
 }
 
 // decodeValues 在消费时间戳流之后解码值流。
-func decodeValues(mode Mode, epsilon float64, count int, ts []int64, rest []byte) ([]Sample, error) {
+func decodeValues(mode Mode, epsilon float64, version int, count int, ts []int64, rest []byte) ([]Sample, error) {
 	out := make([]Sample, count)
 	for i := range out {
 		out[i].T = ts[i]
@@ -210,6 +264,18 @@ func decodeValues(mode Mode, epsilon float64, count int, ts []int64, rest []byte
 				return nil, errCorruptBlock
 			}
 			rest = rest[n:]
+			if version >= 2 {
+				if u == 0 {
+					// 转义：8 字节原始 float64 位。
+					if len(rest) < 8 {
+						return nil, errCorruptBlock
+					}
+					out[i].V = math.Float64frombits(binary.LittleEndian.Uint64(rest[:8]))
+					rest = rest[8:]
+					continue
+				}
+				u--
+			}
 			prevQ += unzigzag(u)
 			out[i].V = float64(prevQ) * epsilon
 		}
